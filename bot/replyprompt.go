@@ -171,55 +171,59 @@ func (r *Robot) promptInternal(regexID string, user string, channel string, prom
 		return "", MatcherNotFound
 	}
 	rep.replyChannel = make(chan reply)
+	return r.promptWait(rep, matcher, regexID, user, channel, prompt, false)
+}
 
-	replies.Lock()
-	// See if there's already a continuation in progress for this Robot:user,channel,
-	// and if so append to the list of waiters.
-	waiters, exists := replies.m[matcher]
-	if exists {
-		r.Log(Debug, fmt.Sprintf("Delaying prompt \"%s\" and appending to the list of waiters for matcher: %q", prompt, matcher))
-		waiters = append(waiters, rep)
-		replies.m[matcher] = waiters
-		replies.Unlock()
-	} else {
-		r.Log(Debug, fmt.Sprintf("Prompting for \"%s \" and creating reply waiters list and prompting for matcher: %q", prompt, matcher))
-		var ret RetVal
-		if channel == "" {
-			ret = robot.SendProtocolUserMessage(user, prompt, r.Format)
-		} else {
-			ret = robot.SendProtocolUserChannelMessage(user, channel, prompt, r.Format)
-		}
-		if ret != Ok {
+func (r *Robot) promptWait(rep replyWaiter, matcher replyMatcher, regexID, user, channel, prompt string, retry bool) (string, RetVal) {
+	if !retry {
+		replies.Lock()
+		// See if there's already a continuation in progress for this Robot:user,channel,
+		// and if so append to the list of waiters.
+		waiters, exists := replies.m[matcher]
+		if exists {
+			r.Log(Debug, fmt.Sprintf("Delaying prompt \"%s\" and appending to the list of waiters for matcher: %q", prompt, matcher))
+			waiters = append(waiters, rep)
+			replies.m[matcher] = waiters
 			replies.Unlock()
-			return "", ret
+		} else {
+			r.Log(Debug, fmt.Sprintf("Prompting for \"%s \" and creating reply waiters list and prompting for matcher: %q", prompt, matcher))
+			var ret RetVal
+			if channel == "" {
+				ret = robot.SendProtocolUserMessage(user, prompt, r.Format)
+			} else {
+				ret = robot.SendProtocolUserChannelMessage(user, channel, prompt, r.Format)
+			}
+			if ret != Ok {
+				replies.Unlock()
+				return "", ret
+			}
+			waiters = make([]replyWaiter, 1, 2)
+			waiters[0] = rep
+			replies.m[matcher] = waiters
+			replies.Unlock()
 		}
-		waiters = make([]replyWaiter, 1, 2)
-		waiters[0] = rep
-		replies.m[matcher] = waiters
-		replies.Unlock()
 	}
 	var replied reply
 	select {
 	case <-time.After(replyTimeout):
 		Log(Warn, fmt.Sprintf("Timed out waiting for a reply to regex \"%s\" in channel: %s", regexID, r.Channel))
 		replies.Lock()
-		waitlist, found := replies.m[matcher]
-		if found {
-			// reply timed out, free up this matcher for later reply requests
-			delete(replies.m, matcher)
+		waitlist, waitingForReply := replies.m[matcher]
+		if waitingForReply {
+			if len(waitlist) == 1 {
+				delete(replies.m, matcher)
+			} else {
+				replies.m[matcher] = waitlist[1:]
+			}
 			replies.Unlock()
 			Log(Debug, fmt.Sprintf("Timeout expired waiting for reply to: %s", prompt))
-			// let other waiters know to retry
-			for i, rep := range waitlist {
-				if i != 0 {
-					Log(Debug, "Sending retryPrompt to waiters on primary waiter timeout")
-					rep.replyChannel <- reply{false, retryPrompt, ""}
-				}
-			}
+			// let next waiter know to retry
+			waitlist[0].replyChannel <- reply{false, retryPrompt, ""}
 			// matched=false, timedOut=true
 			return "", TimeoutExpired
 		}
-		// race: we got a reply at the timeout deadline, and lost the race
+		// If the timeout expired but we didn't find a list of waiters, we hit a race condition:
+		// We got a reply at the timeout deadline, and lost the race with dispatch.go/handleMessage
 		// to delete the entry, so we read the reply as if the timeout hadn't
 		// expired.
 		replies.Unlock()
@@ -230,7 +234,8 @@ func (r *Robot) promptInternal(regexID string, user string, channel string, prom
 		return "", Interrupted
 	}
 	if replied.disposition == retryPrompt {
-		return "", RetryPrompt
+		// We've reached the top of the queue
+		return r.promptWait(rep, matcher, regexID, user, channel, prompt, true)
 	}
 	// Note: the replies.m[] entry is deleted in handleMessage
 	if !replied.matched {

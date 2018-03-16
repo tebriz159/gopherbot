@@ -188,16 +188,18 @@ func checkPluginMatchersAndRun(checkCommands bool, bot *Robot, messagetext strin
 		// waited on
 		replyMatcher := replyMatcher{bot.User, bot.Channel}
 		replies.Lock()
-		waiters, waitingForReply := replies.m[replyMatcher]
+		waitlist, waitingForReply := replies.m[replyMatcher]
 		if waitingForReply {
-			delete(replies.m, replyMatcher)
+			if len(waitlist) == 1 {
+				delete(replies.m, replyMatcher)
+			} else {
+				replies.m[replyMatcher] = waitlist[1:]
+			}
 			replies.Unlock()
-			for i, rep := range waiters {
-				if i == 0 {
-					rep.replyChannel <- reply{false, replyInterrupted, ""}
-				} else {
-					rep.replyChannel <- reply{false, retryPrompt, ""}
-				}
+			waitlist[0].replyChannel <- reply{false, replyInterrupted, ""}
+			if len(waitlist) > 1 {
+				Log(Debug, "Sending retry to next reply waiter")
+				waitlist[1].replyChannel <- reply{false, retryPrompt, ""}
 			}
 			Log(Debug, fmt.Sprintf("User \"%s\" matched a new command while the robot was waiting for a reply in channel \"%s\"", bot.User, bot.Channel))
 		} else {
@@ -262,31 +264,32 @@ func handleMessage(isCommand bool, channel, user, messagetext string) {
 		commandMatched = checkPluginMatchersAndRun(true, bot, messagetext)
 	}
 	// See if the robot was waiting on a reply
-	var waiters []replyWaiter
+	var waitlist []replyWaiter
 	waitingForReply := false
 	if !commandMatched {
 		matcher := replyMatcher{user, channel}
 		Log(Trace, fmt.Sprintf("Checking replies for matcher: %q", matcher))
 		replies.Lock()
-		waiters, waitingForReply = replies.m[matcher]
+		waitlist, waitingForReply = replies.m[matcher]
 		if !waitingForReply {
 			replies.Unlock()
 			// Log(Trace, "No matching replyWaiter")
 		} else {
-			delete(replies.m, matcher)
+			if len(waitlist) == 1 {
+				delete(replies.m, matcher)
+			} else {
+				replies.m[matcher] = waitlist[1:]
+			}
 			replies.Unlock()
 			// if the robot was waiting on a reply, we don't want to check for
 			// ambient message matches - the plugin will handle it.
 			commandMatched = true
-			for i, rep := range waiters {
-				if i == 0 {
-					matched := rep.re.MatchString(messagetext)
-					Log(Debug, fmt.Sprintf("Found replyWaiter for user \"%s\" in channel \"%s\", checking if message \"%s\" matches \"%s\": %t", user, channel, messagetext, rep.re.String(), matched))
-					rep.replyChannel <- reply{matched, replied, messagetext}
-				} else {
-					Log(Debug, "Sending retry to next reply waiter")
-					rep.replyChannel <- reply{false, retryPrompt, ""}
-				}
+			matched := waitlist[0].re.MatchString(messagetext)
+			Log(Debug, fmt.Sprintf("Found replyWaiter for user \"%s\" in channel \"%s\", checking if message \"%s\" matches \"%s\": %t", user, channel, messagetext, waitlist[0].re.String(), matched))
+			waitlist[0].replyChannel <- reply{matched, replied, messagetext}
+			if len(waitlist) > 1 {
+				Log(Debug, "Sending retry to next reply waiter")
+				waitlist[1].replyChannel <- reply{false, retryPrompt, ""}
 			}
 		}
 	}
